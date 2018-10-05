@@ -1,0 +1,170 @@
+#!/bin/bash
+# vim: set tabstop=8 shiftwidth=4 softtabstop=4 expandtab smarttab colorcolumn=80:
+#
+# Copyright (c) 2018 Red Hat, Inc.
+# Author: Nathaniel McCallum <npmccallum@redhat.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+function usage() {
+    echo >&2
+    echo "Usage: jcontract CMD OPTIONS" >&2
+    echo >&2
+    echo "Commands:" >&2
+    echo >&2
+    echo "  create ARGS < PLAINTEXT > JWE" >&2
+    echo "      -e EXECUTOR : Path to the contract executor's public JWK" >&2
+    echo "      -o ORACLE   : Path to the contract oracle's public JWK" >&2
+    echo "      -p POLICY   : JSON-formatted contract policy" >&2
+    echo "      -u URL      : URL for the contract oracle" >&2
+    echo >&2
+    echo "    The create command encrypts input plaintext under a contract." >&2
+    echo "    The input data should be small to reduce network traffic." >&2
+    echo "    If encrypting large data, it is recommended to provide only" >&2
+    echo "    a key as input to this command. You can then independently use" >&2
+    echo "    the key to encrypt the data out of band." >&2
+    echo >&2
+    echo "    For more details, see the execute command below." >&2
+    echo >&2
+    echo >&2
+    echo "  execute ARGS < JWE > PLAINTEXT" >&2
+    echo "      -e EXECUTOR : Path to the contract executor's private JWK" >&2
+    echo "      -p          : Just extract the policy. Don't submit." >&2
+    echo >&2
+    echo "    The create command attempts to execute the contract by sending" >&2
+    echo "    it to the oracle. This command is run by the executor and thus" >&2
+    echo "    requires access to the executor's private key." >&2
+    echo >&2
+    echo "    After the outer JWE is removed, the middle JWE is POSTed to the" >&2
+    echo "    URL specified in the create command (above). The oracle will" >&2
+    echo "    decrypt the middle JWE and evaluate the policy. If the policy" >&2
+    echo "    is fulfilled, the inner JWE will be returned to the executor." >&2
+    echo >&2
+    echo "    Upon successful return from the oracle, the executor's private" >&2
+    echo "    key is used again to decrypt the inner JWE. The data is then" >&2
+    echo "    printed to standard output." >&2
+    echo >&2
+    echo >&2
+    echo "  evaluate ARGS -- POLICY_CMD" >&2
+    echo "      -o ORACLE : Path to the contract oracle's private JWK" >&2
+    echo >&2
+    echo "    This command turns jcontract into a CGI script. It will handle" >&2
+    echo "    all of the request details and pass the policy JSON on standard" >&2
+    echo "    input to the specified policy command. If this command has a zero" >&2
+    echo "    exit status, the inner JWE will be returned to the client." >&2
+    echo "    Otherwise, 403 Forbidden will be returned." >&2
+    echo >&2
+    echo >&2
+    echo >&2
+    exit 1
+}
+
+function post() {
+    mt="Content-Type: application/jose+json"
+    curl -sfg -X POST -H "$mt" --data-binary @- "$1"
+}
+
+if [ "$1" == "create" ]; then
+    OPTIND=2
+    while getopts ":he:o:p:u:" opt; do
+        case "$opt" in
+        e) executor=$OPTARG;;
+        o) oracle=$OPTARG;;
+        p) policy=$OPTARG;;
+        u) url=$OPTARG;;
+        *) usage;;
+        esac
+    done
+
+    if [ -z "$executor" -o -z "$oracle" -o -z "$policy" -o -z "$url" ]; then
+        echo "MUST specify executor, oracle, policy and url!" >&2
+        usage
+    fi
+
+    jco=`jose fmt -j '{}' -q "$url" -s url -Uj "$policy" -s policy -Uo-`
+    jwe=`jose fmt -j '{}' -j '{}' -j "$jco" -s jcontract -Us protected -Uo-`
+    jose jwe enc -I- -k "$executor" -o- \
+        | jose jwe enc -I- -i "$jwe" -k "$oracle" -o- \
+        | jose jwe enc -I- -k "$executor" -o-
+
+elif [ "$1" == "execute" ]; then
+    OPTIND=2
+    while getopts ":he:p" opt; do
+        case "$opt" in
+        e) executor=$OPTARG;;
+        p) policy=1;;
+        *) usage;;
+        esac
+    done
+
+    if [ -z "$executor" ]; then
+        echo "MUST specify executor!" >&2
+        usage
+    fi
+
+    mid=`jose jwe dec -i- -k "$executor" -O-`
+    
+    if [ $policy ]; then
+        jose fmt -j- -g protected -yg jcontract -g policy -o- <<< "$mid"
+
+    else
+        url=`jose fmt -j "$mid" -g protected -yg jcontract -g url -u-`
+        if ! inn=`post "$url" <<< "$mid"`; then
+            echo "Unable to communicate with server!" >&2
+        fi
+        
+        jose jwe dec -i- -k "$executor" -O- <<< "$inn"
+    fi
+
+elif [ "$1" == "evaluate" ]; then
+    OPTIND=2
+    while getopts ":ho:" opt; do
+        case "$opt" in
+        o) oracle=$OPTARG;;
+        *) usage;;
+        esac
+    done
+    
+    shift $((OPTIND -1))
+
+    if [ -z "$oracle" ]; then
+        echo "MUST specify oracle!" >&2
+        usage
+    fi
+    
+    if [ $# -lt 1 ]; then
+        echo "MUST specify policy evaluation command!" >&2
+        usage
+    fi
+
+    mid=`jose jwe fmt -i- -o-`
+    inn=`jose jwe dec -i- -k "$oracle" -O- <<< "$mid"`
+    pol=`jose fmt -j- -g protected -yg jcontract -g policy -o- <<< "$mid"`
+
+    if $@ >/dev/null <<< "$pol"; then
+        len=`wc -c <<< "$inn"`
+        echo "Content-Type: application/jose+json"
+        echo "Content-Length: $len"
+        echo "Status: 200 Success"
+        echo ""
+        echo -n $inn
+    else
+        echo "Status: 403 Forbidden"
+        echo ""
+    fi
+
+else
+    usage
+fi
